@@ -211,6 +211,8 @@ def argParser(args: list) -> stockOrder:
     # If first argument is holdings, set holdings to true
     if args[0] == "holdings":
         orderObj.set_holdings(True)
+        orderObj.set_brokers(SUPPORTED_BROKERS)
+        return orderObj
         # Next argument is brokers
         if args[1] == "all":
             orderObj.set_brokers(SUPPORTED_BROKERS)
@@ -233,26 +235,26 @@ def argParser(args: list) -> stockOrder:
         return orderObj
     # Otherwise: action, amount, stock, broker, (optional) not broker, (optional) dry
     orderObj.set_action(args[0])
-    orderObj.set_amount(args[1])
-    for stock in args[2].split(","):
+    orderObj.set_amount(1)
+    for stock in args[1].split(","):
         if stock != "":
             orderObj.set_stock(stock)
     # Next argument is a broker, set broker
-    if args[3] == "all":
+    if args[2] == "all":
         orderObj.set_brokers(SUPPORTED_BROKERS)
-    elif args[3] == "day1":
+    elif args[2] == "day1":
         orderObj.set_brokers(DAY1_BROKERS)
-    elif args[3] == "most":
+    elif args[2] == "most":
         orderObj.set_brokers(list(filter(lambda x: x != "vanguard", SUPPORTED_BROKERS)))
-    elif args[3] == "fast":
+    elif args[2] == "fast":
         orderObj.set_brokers(DAY1_BROKERS + ["robinhood"])
     else:
-        for broker in args[3].split(","):
+        for broker in args[2].split(","):
             if nicknames(broker) in SUPPORTED_BROKERS:
                 orderObj.set_brokers(nicknames(broker))
     # If next argument is not, set not broker
-    if len(args) > 4 and args[4] == "not":
-        for broker in args[5].split(","):
+    if len(args) > 3 and args[3] == "not":
+        for broker in args[4].split(","):
             if nicknames(broker) in SUPPORTED_BROKERS:
                 orderObj.set_notbrokers(nicknames(broker))
     # If next argument is false, set dry to false
@@ -345,7 +347,7 @@ if __name__ == "__main__":
                     "ERROR: Invalid channel ID, please check your DISCORD_CHANNEL in your .env file and try again"
                 )
                 os._exit(1)  # Special exit code to restart docker container
-            await channel.send("Discord bot is started...")
+            await channel.send("Discord bot has started...")
 
         # Process the message only if it's from the specified channel
         @bot.event
