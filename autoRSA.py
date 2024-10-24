@@ -42,6 +42,7 @@ try:
     from vanguardAPI import *
     from webullAPI import *
     from wellsfargoAPI import *
+    from sofiAPI import *
 except Exception as e:
     print(f"Error importing libraries: {e}")
     print(traceback.format_exc())
@@ -69,6 +70,7 @@ SUPPORTED_BROKERS = [
     "vanguard",
     "webull",
     "wellsfargo",
+    "sofi",
 ]
 DAY1_BROKERS = [
     "bbae",
@@ -81,6 +83,7 @@ DAY1_BROKERS = [
     "tastytrade",
     "tradier",
     "webull",
+    "sofi",
 ]
 DISCORD_BOT = False
 DOCKER_MODE = False
@@ -130,6 +133,8 @@ def fun_run(orderObj: stockOrder, command, botObj=None, loop=None):
                         ),
                         broker,
                     )
+                elif broker.lower() == "sofi":
+                    orderObj.set_logged_in(globals()[fun_name](DOCKER=DOCKER_MODE), broker)
                 elif broker.lower() == "tornado":
                     # Requires docker mode argument and loop
                     orderObj.set_logged_in(
