@@ -1,374 +1,814 @@
+import asyncio
 import datetime
 import os
-import re
 import traceback
 from time import sleep
 
+import nodriver as uc
+import pyotp
+from curl_cffi import requests
 from dotenv import load_dotenv
-from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver import Keys
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support.ui import Select
-
 
 from helperAPI import (
     Brokerage,
-    check_if_page_loaded,
-    getDriver,
-    killSeleniumDriver,
+    getOTPCodeDiscord,
     maskString,
     printAndDiscord,
     printHoldings,
     stockOrder,
-    type_slowly,
 )
-DRIVER=getDriver(DOCKER=False)
+
 load_dotenv()
 
-def sofi_error(driver,e):
-    print("SOFI Error: ", e)
-    driver.save_screenshot(f"SOFI-error-{datetime.datetime.now()}.png")
-    #printAndDiscord("SOFI Error: " + str(e))
-    print(traceback.format_exc())
+COOKIES_PATH = "creds"
+# Get or create the event loop
+try:
+    sofi_loop = asyncio.get_event_loop()
+except RuntimeError:
+    sofi_loop = asyncio.new_event_loop()
 
 
-def sofi_init(SOFI_EXTERNAL=None,DOCKER=False):
+def create_creds_folder():
+    """Create the 'creds' folder if it doesn't exist."""
+    if not os.path.exists(COOKIES_PATH):
+        os.makedirs(COOKIES_PATH)
+
+
+def build_headers(csrf_token=None):
+    headers = {
+        "accept": "application/json",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "x-requested-with": "XMLHttpRequest",
+    }
+    if csrf_token is not None:
+        headers["csrf-token"] = csrf_token
+        headers["origin"] = "https://www.sofi.com"
+        headers["referer"] = "https://www.sofi.com/"
+        headers["sec-fetch-site"] = "same-origin"
+        headers["sec-fetch-mode"] = "cors"
+        headers["sec-fetch-dest"] = "empty"
+    return headers
+
+
+async def save_cookies_to_pkl(browser, cookie_filename):
+    try:
+        await browser.cookies.save(cookie_filename)
+    except Exception as e:
+        print(f"Failed to save cookies: {e}")
+
+
+async def load_cookies_from_pkl(browser, page, cookie_filename):
+    try:
+        await browser.cookies.load(cookie_filename)
+        await page.reload()
+        return True
+    except ValueError as e:
+        print(f"Failed to load cookies: {e}")
+    except FileNotFoundError:
+        print("Cookie file does not exist.")
+    return False
+
+
+async def sofi_error(error: str, page=None, discord_loop=None):
+    if page is not None:
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_name = f"SoFi-error-{timestamp}.png"
+            await page.save_screenshot(filename=screenshot_name, full_page=True)
+        except Exception as e:
+            print(f"Failed to take screenshot: {e}")
+    try:
+        printAndDiscord(f"Sofi error: {error}", discord_loop)
+        print(f"SoFi Error: {traceback.format_exc()}")
+    except Exception as e:
+        print(f"Failed to log error: {e}")
+
+
+async def get_current_url(page, discord_loop):
+    """Get the current page URL by evaluating JavaScript."""
+    await page.sleep(1)
+    await page.select("body")
+    try:
+        # Run JavaScript to get the current URL
+        current_url = await page.evaluate("window.location.href")
+        return current_url
+    except Exception as e:
+        await sofi_error(
+            f"Error fetching the current URL {e}", page=page, discord_loop=discord_loop
+        )
+        return None
+
+
+def sofi_run(
+    orderObj: stockOrder, command=None, botObj=None, loop=None, SOFI_EXTERNAL=None
+):
+    print("Initializing SoFi process...")
     load_dotenv()
+    create_creds_folder()
+    discord_loop = (
+        loop  # Keep the parameter as "loop" for consistency with other init functions
+    )
+    browser = None
 
-    if not os.getenv("SOFI"):
-        print("SOFI environment variable not found.")
-        return False
+    if not os.getenv("SOFI") and SOFI_EXTERNAL is None:
+        printAndDiscord("SoFi environment variable not found.", discord_loop)
+        return None
+
     accounts = (
         os.environ["SOFI"].strip().split(",")
         if SOFI_EXTERNAL is None
         else SOFI_EXTERNAL.strip().split(",")
     )
-    SOFI_obj = Brokerage("SOFI")
-    for account in accounts:
-        index = accounts.index(account) + 1
-        name = f"SOFI {index}"
-        account = account.split(":",1)
-        try:
-            print("Logging into SOFI...")
-            driver=DRIVER
-            if driver is None:
-                raise Exception("Driver not found.")
-            driver.get(
-                'https://login.sofi.com/u/login?state=hKFo2SBiMkxuWUxGckdxdVJ0c3BKLTlBdEk1dFgwQnZCcWo0ZKFur3VuaXZlcnNhbC1sb2dpbqN0aWTZIHdDekRxWk81cURTYWVZOVJleEJORE9vMExBVFVjMEw2o2NpZNkgNkxuc0xDc2ZGRUVMbDlTQzBDaWNPdkdlb2JvZXFab2I'
+    sofi_obj = Brokerage("SoFi")
+
+    # Get headless flag
+    headless = os.getenv("HEADLESS", "true").lower() == "true"
+
+    # Set the functions to be run
+    _, second_command = command
+
+    cookie_filename = None
+    try:
+        for account in accounts:
+            index = accounts.index(account) + 1
+            name = f"SoFi {index}"
+            cookie_filename = f"{COOKIES_PATH}/{name}.pkl"
+            browser_args = [
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+            ]
+            if headless:
+                browser_args.append("--headless=new")
+            sleep(2)
+            browser = sofi_loop.run_until_complete(uc.start(browser_args=browser_args))
+            sleep(5)
+            print(f"Logging into {name}...")
+            sofi_init(
+                account, name, cookie_filename, botObj, browser, discord_loop, sofi_obj
             )
-            WebDriverWait(driver, 20).until(check_if_page_loaded)
-            # Login
+            print(f"Logged in to {name}!")
+            if second_command == "_holdings":
+                sofi_holdings(browser, name, sofi_obj, discord_loop)
+            else:
+                sofi_transaction(browser, orderObj, discord_loop)
+    except Exception as e:
+        sofi_loop.run_until_complete(
+            sofi_error(
+                f"Error during SoFi init process: {e}", discord_loop=discord_loop
+            )
+        )
+        return None
+    finally:
+        if browser:
             try:
-                print("Username:", account[0], "Password:", (account[1]))
-                username_field = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='username']")))
-                username_field.send_keys(account[0])
-
-                # Wait for the password field and enter the password
-                password_field = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='password']")))
-                password_field.send_keys(account[1])
-                
-
-
-                login_button = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='widget_block']/div/div[2]/div/div/main/section/div/div/div/form/div[2]/button")))
-                login_button.click()
-                #//*[@id="prompt-alert"]/p
-                try:
-                    tooManyAttempts=WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, "//*[@id='prompt-alert']/p")))
-                    print("Too many attempts, give it a break and come back later.")
-                except TimeoutException:
-                    return
-                print("=====================================================\n")
-              
-                code2fa=input('Please enter code and press ENTER to continue:')
-              
-                code_field = WebDriverWait(driver, 60).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='code']")))
-                code_field.send_keys(code2fa)
+                sofi_loop.run_until_complete(
+                    save_cookies_to_pkl(browser, cookie_filename)
+                )
+                browser.stop()
+            except Exception as e:
+                sofi_loop.run_until_complete(
+                    sofi_error(
+                        f"Error closing the browser: {e}", discord_loop=discord_loop
+                    )
+                )
+    return None
 
 
+def sofi_init(
+    account, name, cookie_filename, botObj, browser, discord_loop, sofi_obj: Brokerage
+):
+    page = None
+    try:
+        account = account.split(":")
 
-                code_button = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='widget_block']/div/div[2]/div/div/main/section/div/div/div/div[1]/div/form/div[3]/button")))
-                code_button.click()
-            except TimeoutException:
-                print("TimeoutException: Login failed.")
-                return False
-            SOFI_obj.set_logged_in_object(name, driver)
+        # The page sometimes doesn't load until after retrying
+        max_attempts = 5
+        attempts = 0
+        while attempts < max_attempts:
+            page = sofi_loop.run_until_complete(browser.get("https://www.sofi.com/"))
+            sofi_loop.run_until_complete(page)  # Wait for events to be processed
+            current_url = sofi_loop.run_until_complete(
+                get_current_url(page, discord_loop)
+            )
+            if current_url == "https://www.sofi.com/":
+                break
 
-        except Exception as e:
-            sofi_error(driver,e)
-            driver.close()
-            driver.quit()
-            return None
-    return SOFI_obj
+            attempts += 1
+
+        # Load cookies
+        sofi_loop.run_until_complete(page)  # Wait for events to be processed
+        sleep(5)
+        page = sofi_loop.run_until_complete(browser.get("https://www.sofi.com"))
+        cookies_loaded = sofi_loop.run_until_complete(
+            load_cookies_from_pkl(browser, page, cookie_filename)
+        )
+
+        if cookies_loaded:
+            sofi_loop.run_until_complete(page.get("https://www.sofi.com/wealth/app/"))
+            sofi_loop.run_until_complete(browser.sleep(5))
+            sofi_loop.run_until_complete(page.select("body"))
+            current_url = sofi_loop.run_until_complete(
+                get_current_url(page, discord_loop)
+            )
+
+            if current_url and "overview" in current_url:
+                sofi_loop.run_until_complete(
+                    save_cookies_to_pkl(browser, cookie_filename)
+                )
+                return sofi_obj
+
+        # Proceed with login if cookies are invalid or expired
+        sofi_loop.run_until_complete(
+            sofi_login_and_account(browser, page, account, name, botObj, discord_loop)
+        )
+        sofi_obj.set_logged_in_object(name, browser)
+    except Exception as e:
+        sofi_loop.run_until_complete(
+            sofi_error(
+                f"Error during SoFi init process: {e}",
+                page=page,
+                discord_loop=discord_loop,
+            )
+        )
+        return None
+    return sofi_obj
 
 
-def sofi_transaction(SOFI_o:Brokerage,orderObj:stockOrder,loop=None,DOCKER=False):
-    print()
-    print("==============================")
-    print("SOFI")
-    print("==============================")
-    print()
-    
-    #driver: webdriver = SOFI_o.get_logged_in_objects(key)
-    driver=DRIVER
-    #print(orderObj.get_stocks())
-    investment_button = WebDriverWait(driver, 20).until(
-        EC.element_to_be_clickable((By.XPATH, "//*[@id='root']/div/header/nav/div[2]/a[4]")))
-    investment_button.click()
-    
-    for s in orderObj.get_stocks():
+async def sofi_login_and_account(browser, page, account, name, botObj, discord_loop):
+    try:
+        sleep(5)
+        page = await browser.get("https://www.sofi.com")
+        if not page:
+            raise Exception(f"Failed to load SoFi login page for {name}")
+
+        await page.get("https://www.sofi.com/wealth/app")
+        sleep(2)
+        username_input = await page.select("input[id=username]")
+        if not username_input:
+            raise Exception(f"Unable to locate the username input field for {name}")
+        await username_input.send_keys(account[0])
+
+        password_input = await page.select("input[type=password]")
+        if not password_input:
+            raise Exception(f"Unable to locate the password input field for {name}")
+        await password_input.send_keys(account[1])
+
+        login_button = await page.find("Log In", best_match=True)
+        if not login_button:
+            raise Exception(f"Unable to locate the login button for {name}")
+        await login_button.click()
+
+        await page.select("body")
+
+        current_url = await get_current_url(page, discord_loop)
+        if current_url is not None and "overview" not in current_url:
+            await handle_2fa(page, account, name, botObj, discord_loop)
+    except Exception as e:
+        await sofi_error(
+            f"Error logging into account {name}: {e}",
+            page=page,
+            discord_loop=discord_loop,
+        )
+
+
+async def sofi_account_info(browser, discord_loop):
+    try:
+        await browser.sleep(1)
+        await browser.get("https://www.sofi.com/wealth/app/overview")
+        await browser.sleep(5)
+
+        cookies = await browser.cookies.get_all()
+        cookies_dict = {cookie.name: cookie.value for cookie in cookies}
+        response = requests.get(
+            "https://www.sofi.com/wealth/backend/v1/json/accounts",
+            impersonate="chrome",
+            headers=build_headers(),
+            cookies=cookies_dict,
+        )
+
+        if response.status_code != 200:
+            raise Exception(
+                f"Failed to fetch account info, status code: {response.status_code}"
+            )
+
+        accounts_data = response.json()
+        account_dict = {}
+
+        for account in accounts_data:
+            account_number = account["apexAccountId"]
+            account_id = account["id"]
+            account_type = account["type"]["description"]
+            current_value = account["totalEquityValue"]
+
+            account_dict[account_number] = {
+                "type": account_type,
+                "balance": float(current_value),
+                "id": account_id,
+            }
+        return account_dict
+    except Exception as e:
+        await sofi_error(
+            f"Error fetching SoFi account information: {e}", discord_loop=discord_loop
+        )
+        return None
+
+
+def sofi_holdings(browser, name, sofi_obj: Brokerage, discord_loop):
+    account_dict: dict = sofi_loop.run_until_complete(
+        sofi_account_info(browser, discord_loop)
+    )
+    if not account_dict:
+        raise Exception(f"Failed to retrieve account info for {name}")
+
+    for acct, account_info in account_dict.items():
+        real_account_number = acct
+        sofi_obj.set_account_number(name, real_account_number)
+        sofi_obj.set_account_totals(name, real_account_number, account_info["balance"])
+
+        account_id = account_info.get("id")
+        cookies = {
+            cookie.name: cookie.value
+            for cookie in sofi_loop.run_until_complete(browser.cookies.get_all())
+        }
+
         try:
-            search_field = WebDriverWait(driver, 20).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[@id='page-wrap']/div[1]/div/div/div/div/input")))
-            search_field.send_keys(s)
-            WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.XPATH, "//*[@id='page-wrap']/div[1]/div/div/div/ul/li")))
-            dropdown_items = driver.find_elements(By.XPATH, "//*[@id='page-wrap']/div[1]/div/div/div/ul/li")
-            total_items = len(dropdown_items)
-        except TimeoutException:
-            try:
-                invest_search_field=WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[1]/div/div/div/input")))
-                invest_search_field.send_keys(s)
-                WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[1]/div/div/ul/li")))
-                dropdown_items = driver.find_elements(By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[1]/div/div/ul/li")
-                total_items = len(dropdown_items)
-            except TimeoutException:
-                print("Search field not found")
-                return
-        #//*[@id="mainContent"]/div[2]/div[2]/div[2]/div[1]/div/div/ul/li
+            holdings = sofi_loop.run_until_complete(
+                get_holdings_formatted(account_id, cookies)
+            )
+        except Exception as e:
+            sofi_loop.run_until_complete(
+                sofi_error(
+                    f"Error fetching holdings for SOFI account {maskString(account_id)}: {e}",
+                    discord_loop=discord_loop,
+                )
+            )
+            continue
 
-        if total_items == 0:
-            print("No stock found")
-            return
+        for holding in holdings:
+            company_name = holding.get("company_name", "N/A")
+            if company_name == "|CASH|":
+                continue
+
+            shares = holding.get("shares", "N/A")
+            price = holding.get("price", "N/A")
+            sofi_obj.set_holdings(
+                name, real_account_number, company_name, shares, price
+            )
+
+    # Log info after holdings are processed
+    print(f"All holdings processed for {name}.")
+    printHoldings(sofi_obj, discord_loop)
+
+
+async def get_holdings_formatted(account_id, cookies):
+    holdings_url = f"https://www.sofi.com/wealth/backend/api/v3/account/{account_id}/holdings?accountDataType=INTERNAL"
+    response = requests.get(
+        holdings_url, impersonate="chrome", headers=build_headers(), cookies=cookies
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Failed to fetch holdings, status code: {response.status_code}"
+        )
+
+    holdings_data = response.json()
+
+    formatted_holdings = []
+
+    for holding in holdings_data.get("holdings", []):
+        company_name = holding.get("symbol", "N/A")
+        shares = holding.get("shares", "N/A")
+        price = holding.get("price", "N/A")
+
+        formatted_holdings.append(
+            {
+                "company_name": company_name if company_name else "N/A",
+                "shares": float(shares) if shares is not None else "N/A",
+                "price": float(price) if price is not None else "N/A",
+            }
+        )
+
+    return formatted_holdings
+
+
+def get_2fa_code(secret):
+    totp = pyotp.TOTP(secret)
+    return totp.now()
+
+
+async def handle_2fa(page, account, name, botObj, discord_loop):
+    """
+    Handle both authenticator app 2FA and SMS-based 2FA.
+    """
+    try:
+        # Authenticator app 2FA handling (if secret exists)
+        secret = account[2] if len(account) > 2 else None
+        # Checks for people that don't read the README
+        if isinstance(secret, str) and (
+            secret.lower() == "none" or secret.lower() == "false"
+        ):
+            secret = None
+        if secret is not None:
+            remember = await page.select("input[id=rememberBrowser]")
+            if remember:
+                await remember.click()
+
+            twofa_input = await page.select("input[id=code]")
+            if not twofa_input:
+                raise Exception(f"Unable to locate 2FA input field for {name}")
+
+            two_fa_code = get_2fa_code(secret)  # Get the OTP from the authenticator app
+            await twofa_input.send_keys(two_fa_code)
+            verify_button = await page.find("Verify Code")
+            if verify_button:
+                await verify_button.click()
         else:
-            found_stock = False
-            for item in dropdown_items:
-                ticker_name = item.find_element(By.XPATH, "./a/div/p[1]").text
-                if ticker_name == s:
-                    found_stock = True
-                    item.click()
-                    break
+            # Set a timeout duration for finding the SMS 2FA element
+            sms_2fa_element = None
+            try:
+                sms_2fa_element = await asyncio.wait_for(
+                    page.find("We've sent a text message to:", best_match=True),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"SMS 2FA text not found for {name}, proceeding to check for authenticator app 2FA..."
+                )
 
-            if not found_stock:
-                print(f"SOFI DOESN'T HAVE {s}")
-                return
-        #print(orderObj.get_action())
+            if sms_2fa_element:
+                # SMS 2FA handling
+                remember = await page.select("input[id=rememberBrowser]")
+                if remember:
+                    await remember.click()
+                sms2fa_input = await page.select("input[id=code]")
+                if not sms2fa_input:
+                    raise Exception(f"Unable to locate SMS 2FA input field for {name}")
+
+                if botObj is not None and discord_loop is not None:
+                    sms_code = asyncio.run_coroutine_threadsafe(
+                        getOTPCodeDiscord(botObj, name, loop=discord_loop),
+                        discord_loop,
+                    ).result()
+                    if sms_code is None:
+                        raise Exception(f"Sofi {name} SMS code not received in time...")
+                else:
+                    sms_code = input("Enter code: ")
+
+                await sms2fa_input.send_keys(sms_code)
+                verify_button = await page.find("Verify Code")
+                if verify_button:
+                    await verify_button.click()
+            else:
+                raise Exception(f"No valid 2FA method found for {name}.")
+
+    except Exception as e:
+        await sofi_error(
+            f"Error during 2FA handling for {name}: {e}",
+            page=page,
+            discord_loop=discord_loop,
+        )
+
+
+def sofi_transaction(browser, orderObj: stockOrder, discord_loop):
+    dry_mode = orderObj.get_dry()
+    for stock in orderObj.get_stocks():
         if orderObj.get_action() == "buy":
-            #print(f"Buying {orderObj.get_quantity(s)} shares of {s} at ${orderObj.get_price(s)}")
-            clicked_values = set()  # Set to keep track of processed accounts
-           
-            DRY=orderObj.get_dry()
-            QUANTITY=orderObj.get_amount()
-            print("DRY MODE:", DRY)
-            while True:
-                # Click the buy button
-                sleep(5)
-                buy_button = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[2]/div/button[1]")))
-                driver.execute_script("arguments[0].click();", buy_button)
-                #print("BUY BUTTON CLICKED")
-                #//*[@id="shares"]
-                #//*[@id="shares"]
-                try:
-                    shares=WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='shares']")))
-                    shares.click()
-                    #//*[@id="OrderTypedDropDown"]
-                    OrderTypedDropDown=WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='OrderTypedDropDown']")))
-                    OrderTypedDropDown.click()
-                    #//*[@id="OrderTypedDropDown"]/option[2]
-                    OrderTypedDropDown_limit=WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='OrderTypedDropDown']/option[2]")))
-                    OrderTypedDropDown_limit.click()
-                except TimeoutException:
-                    #print("Shares field not found")
-                    pass
-                    
-
-                # Fetch the live price
-                live_price = WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/p"))).text
-                live_price = live_price.split('$')[1]
-                #print("LIVE PRICE:", live_price)
-
-                # Handle account selection
-                accounts_dropdown = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.NAME, "account")))
-                select = Select(accounts_dropdown)
-
-                # Find an unclicked account
-                for option in select.options:
-                    value = option.get_attribute('value')
-                    if value not in clicked_values:
-                        select.select_by_value(value)
-                        #print("Selected account:", value)
-                        clicked_values.add(value)
-                        break
-                else:
-                    print(f"All accounts have been processed for {s}.")
-                    try:
-                        cancel_button = WebDriverWait(driver, 20).until(
-                            EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/a")))
-                        cancel_button.click()
-                    except TimeoutException:
-                        pass
-                    break  # Exit the while loop if all accounts are processed
-
-                # Input quantity and price
-                #print("Inputting quantity and price")
-                sleep(5)
-                quant = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.NAME, "shares")))
-                quant.send_keys(QUANTITY)
-                sleep(5)
-                limit_price = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.NAME, "value")))
-                limit_price.send_keys(str(float(live_price) + 0.01))
-                #//*[@id="mainContent"]/div[2]/div[2]/div[3]/div/div[8]/div/p
-                try:
-                    #//*[@id="mainContent"]/div[2]/div[2]/div[3]/div/h2
-                    available_funds = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/h2")))
-                    
-                    Insufficient_funds=WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[8]/div/p")))
-                    print(f"Insufficient funds. {s}'s price is {live_price}, Available funds {available_funds.text}.")
-                    #//*[@id="mainContent"]/div[2]/div[2]/div[3]/a
-                    cancel_button = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/a")))
-                    cancel_button.click()
-                    continue    
-                except TimeoutException:
-                    pass
-                # Review and submit the order
-                review_button = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[8]/button")))
-                review_button.click()
-                if DRY == 'False':
-                    submit_button = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[4]/button[1]")))
-                    submit_button.click()
-                    print("Order submitted for", QUANTITY, "shares of", s, "at", str(float(live_price) + 0.01))
-                    
-                    # Confirm the order
-                    done_button = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[2]/button")))
-                    done_button.click()
-                    print("Order completed and confirmed.")
-                elif(DRY=='True'):
-                    #print("testing before back")
-                    sleep(5)
-                    back_button = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[4]/button[2]")))
-                    back_button.click()
-                    sleep(3)
-                    print("DRY MODE")
-                    print("Submitting order BUY for", QUANTITY, "shares of", s, "at", str(float(live_price) + 0.01))
+            sofi_loop.run_until_complete(
+                sofi_buy(browser, stock, orderObj.get_amount(), discord_loop, dry_mode)
+            )
         elif orderObj.get_action() == "sell":
-               
+            sofi_loop.run_until_complete(
+                sofi_sell(browser, stock, orderObj.get_amount(), discord_loop, dry_mode)
+            )
+        else:
+            print(f"Unknown action: {orderObj.get_action()}")
 
-            sell = WebDriverWait(driver, 50).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[2]/div/button[2]")))
-            sell.click()
-    
-            accounts_dropdown = WebDriverWait(driver, 20).until(
-                EC.element_to_be_clickable((By.NAME, "account")))
-        
-            select=Select(accounts_dropdown)
-            #print("select", select)
-            Options=select.options
-            #print("options", Options)
-            Options_length=len(Options)
-        
 
-            for index in range(Options_length):
-                if index !=0:
-                    sell = WebDriverWait(driver, 50).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[2]/div[2]/div/button[2]")))
-                    sell.click()
-                    quant=WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.NAME, "shares")))
-                    quant.send_keys(QUANTITY)
-                    #print('Quant sent')
-                    #//*[@id="mainContent"]/div[2]/div[2]/div[3]/div/div[6]/button
-                    sell_button_INDEX = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[6]/button")))
-                    sell_button_INDEX.click()
+async def sofi_buy(browser, symbol, quantity, discord_loop, dry_mode=False):
+    page = None
+    try:
+        # Step 1: Navigate to stock page and get valid cookies
+        stock_url = f"https://www.sofi.com/wealth/app/stock/{symbol}"
+        page = await browser.get(stock_url)
+        await page.select("body")
+
+        cookies = {
+            cookie.name: cookie.value for cookie in await browser.cookies.get_all()
+        }
+        if not cookies:
+            raise Exception("Failed to retrieve valid cookies for the session.")
+
+        csrf_token = cookies.get("SOFI_CSRF_COOKIE") or cookies.get("SOFI_R_CSRF_TOKEN")
+        if not csrf_token:
+            raise Exception("Failed to retrieve CSRF token from cookies.")
+
+        # Step 2: Get the stock price
+        stock_price = await fetch_stock_price(symbol)
+        if stock_price is None:
+            raise Exception(f"Failed to retrieve stock price for {symbol}")
+
+        limit_price = stock_price
+
+        # Step 3: Fetch all funded accounts and their buying power
+        accounts = await fetch_funded_accounts(cookies)
+        if not accounts:
+            raise Exception("Failed to retrieve funded accounts or none available.")
+
+        # Step 4: Loop through all accounts to check buying power and place the limit order
+        for account in accounts:
+            account_id = account["accountId"]
+            buying_power = account["accountBuyingPower"]
+            account_name = account.get("accountType")
+
+            total_price = limit_price * quantity
+            if total_price <= buying_power:
+                if dry_mode:
+                    # Dry mode: Log what would have been done
+                    printAndDiscord(
+                        f"[DRY MODE] Would place limit order for {symbol} in account {account_name} with limit price: {limit_price}",
+                        discord_loop,
+                    )
+                    continue
+
+                if quantity < 1:
+                    result = await place_fractional_order(
+                        symbol,
+                        quantity,
+                        account_id,
+                        order_type="BUY",
+                        cookies=cookies,
+                        csrf_token=csrf_token,
+                        discord_loop=discord_loop,
+                    )
                 else:
-                    wait=WebDriverWait(driver,10)
-                    wait.until(EC.presence_of_all_elements_located((By.NAME, "account")))
-                    select = Select(WebDriverWait(driver, 20).until(
-                                    EC.presence_of_element_located((By.NAME, "account"))))
-                    select.select_by_index(index)
-                    #print("Selected account index:", index)
-                    #time.sleep(3)
-                    
-                    quant=WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.NAME, "shares")))
-                    quant.send_keys(QUANTITY)
-                    #print('Quant sent')
-                    #//*[@id="mainContent"]/div[2]/div[2]/div[3]/div/div[6]/button
-                    WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[6]/button")))
-                    sell_button=driver.find_element(By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[6]/button")
-                    driver.execute_script("arguments[0].click();", sell_button)
+                    result = await place_order(
+                        symbol,
+                        quantity,
+                        limit_price,
+                        account_id,
+                        order_type="BUY",
+                        cookies=cookies,
+                        csrf_token=csrf_token,
+                        discord_loop=discord_loop,
+                    )
+                if result["header"] == "Your order is placed.":  # Success
+                    printAndDiscord(
+                        f"Successfully bought {quantity} of {symbol} in account {maskString(account_id)}",
+                        discord_loop,
+                    )
+            else:
+                printAndDiscord(
+                    f"Insufficient buying power in {account_name}. Needed: {total_price}, Available: {buying_power}",
+                    discord_loop,
+                )
+    except Exception as e:
+        await sofi_error(
+            f"Error during buy transaction for {symbol}: {e}",
+            page=page,
+            discord_loop=discord_loop,
+        )
 
-                #limit_price=WebDriverWait(driver, 20).until(
-                # EC.element_to_be_clickable((By.NAME, "value")))
-                #limit_price.send_keys(str(float(live_price) + 0.01))
-                #print('Limit price sent')
-                #time.sleep(3)
 
-                
-                #review_button = WebDriverWait(driver, 20).until(
-                    #EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[8]/button")))
-                #review_button.click()
-            
-                if(DRY=='False'):
-                    #//*[@id="mainContent"]/div[2]/div[2]/div[3]/div/div[4]/button[1]
-                    submit_button = WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[4]/button[1]")))
-                    submit_button.click()
-                    print("LIVE MODE")
-                    done=WebDriverWait(driver, 20).until(
-                        EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[2]/button")))
-                    done.click()
-                    print("Submitting order SELL for", QUANTITY, "shares of", s, "at", str(float(live_price) + 0.01))
-                    index+=1
-                elif(DRY=='True'):
-                    
-                    #print("testing before back")
-                    #time.sleep(5)
-                    try:
-                        # Try to find and click the back_button
-                        back_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[4]/button[2]")))
-                        back_button.click()
-                    except TimeoutException:
-                        try:
-                            # If back_button is not found, try to find and click the Out_of_market_back_button
-                            Out_of_market_back_button = WebDriverWait(driver, 20).until(
-                                EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/div/div[6]/div/button[2]")))
-                            Out_of_market_back_button.click()
-                        except TimeoutException:
-                            print("Neither button was found.")
-                        #time.sleep(3)
-                        print("DRY MODE")
-                        print("Submitting order SELL for", QUANTITY, "shares of", s, "at", str(float(live_price) + 0.01))
-                        #//*[@id="mainContent"]/div[2]/div[2]/div[3]/a
-                        cancel_button = WebDriverWait(driver, 20).until(
-                            EC.element_to_be_clickable((By.XPATH, "//*[@id='mainContent']/div[2]/div[2]/div[3]/a")))
-                        cancel_button.click()
-                        index+=1
-    print("Completed all transactions, Exiting...")
-    driver.close()
-    driver.quit()
+async def sofi_sell(browser, symbol, quantity, discord_loop, dry_mode=False):
+    try:
+        # Step 1: Fetch holdings for the stock symbol
+        cookies = {
+            cookie.name: cookie.value for cookie in await browser.cookies.get_all()
+        }
+        if not cookies:
+            raise Exception("Failed to retrieve valid cookies for the session.")
+
+        csrf_token = cookies.get("SOFI_CSRF_COOKIE") or cookies.get("SOFI_R_CSRF_TOKEN")
+        if not csrf_token:
+            raise Exception("Failed to retrieve CSRF token from cookies.")
+
+        # Fetch holdings for the specific symbol
+        holdings_url = f"https://www.sofi.com/wealth/backend/api/v3/customer/holdings/symbol/{symbol}"
+        response = requests.get(
+            holdings_url, impersonate="chrome", headers=build_headers(), cookies=cookies
+        )
+
+        if response.status_code != 200:
+            raise Exception(
+                f"Failed to fetch holdings for {symbol}. Status code: {response.status_code}"
+            )
+
+        holdings_data = response.json()
+        account_holding_infos = holdings_data.get("accountHoldingInfos", [])
+
+        if not account_holding_infos:
+            raise Exception(
+                f"No holdings found for symbol {symbol}. Cannot proceed with the sell order."
+            )
+
+        total_available_shares = sum(
+            info["salableQuantity"] for info in account_holding_infos
+        )
+
+        if total_available_shares < quantity:
+            raise Exception(
+                f"Not enough shares to sell. Available: {total_available_shares}, Requested: {quantity}"
+            )
+
+        stock_price = await fetch_stock_price(symbol)
+        if stock_price is None:
+            raise Exception(f"Failed to retrieve stock price for {symbol}")
+
+        limit_price = round(stock_price - 0.01, 2)
+
+        # Loop through all accounts holding the stock
+        for account in account_holding_infos:
+            account_id = account["accountId"]
+            available_shares = account["salableQuantity"]
+
+            # Skip accounts where available shares are less than the quantity to sell
+            if available_shares < quantity:
+                printAndDiscord(
+                    f"Not enough shares to sell {quantity} of {symbol} in account {maskString(account_id)}. Only {available_shares} available.",
+                    discord_loop,
+                )
+                continue  # Move to the next account
+
+            if dry_mode:
+                # Dry mode: Log what would have been done
+                printAndDiscord(
+                    f"[DRY MODE] Would place sell order for {quantity} shares of {symbol} in account {maskString(account_id)}",
+                    discord_loop,
+                )
+                continue
+
+            if quantity < 1:
+                result = await place_fractional_order(
+                    symbol,
+                    quantity,
+                    account_id,
+                    order_type="SELL",
+                    cookies=cookies,
+                    csrf_token=csrf_token,
+                    discord_loop=discord_loop,
+                )
+            else:
+                # Place the sell order
+                result = await place_order(
+                    symbol,
+                    quantity,
+                    limit_price,
+                    account_id,
+                    order_type="SELL",
+                    cookies=cookies,
+                    csrf_token=csrf_token,
+                    discord_loop=discord_loop,
+                )
+            if result["header"] == "Your order is placed.":  # Success
+                printAndDiscord(
+                    f"Successfully sold {quantity} of {symbol} in account {maskString(account_id)}",
+                    discord_loop,
+                )
+    except Exception as e:
+        await sofi_error(
+            f"Error during sell transaction for {symbol}: {e}",
+            discord_loop=discord_loop,
+        )
+
+
+async def fetch_funded_accounts(cookies):
+    try:
+        url = (
+            "https://www.sofi.com/wealth/backend/api/v1/user/funded-brokerage-accounts"
+        )
+        response = requests.get(
+            url, impersonate="chrome", headers=build_headers(), cookies=cookies
+        )
+        if response.status_code == 200:
+            accounts = response.json()
+            return accounts
+        print(f"Failed to fetch funded accounts. Status code: {response.status_code}")
+        return None
+    except Exception as e:
+        await sofi_error(f"Error fetching funded accounts: {e}")
+        return None
+
+
+async def fetch_stock_price(symbol):
+    try:
+        url = f"https://www.sofi.com/wealth/backend/api/v1/tearsheet/quote?symbol={symbol}&productSubtype=BROKERAGE"
+        response = requests.get(url, impersonate="chrome", headers=build_headers())
+        if response.status_code == 200:
+            data = response.json()
+            price = data.get("price")
+            if price:
+                # Round the price to the nearest second decimal place
+                rounded_price = round(float(price), 2)
+                return rounded_price
+            return None
+        print(
+            f"Failed to fetch stock price for {symbol}. Status code: {response.status_code}"
+        )
+        return None
+    except Exception as e:
+        await sofi_error(f"Error fetching stock price for {symbol}: {e}")
+        return None
+
+
+async def place_order(
+    symbol,
+    quantity,
+    limit_price,
+    account_id,
+    order_type,
+    cookies,
+    csrf_token,
+    discord_loop=None,
+):
+    try:
+        payload = {
+            "operation": order_type,
+            "quantity": str(quantity),
+            "time": "DAY",
+            "type": "LIMIT",
+            "limitPrice": limit_price,
+            "symbol": symbol,
+            "accountId": account_id,
+            "tradingSession": "CORE_HOURS",
+        }
+
+        url = "https://www.sofi.com/wealth/backend/api/v1/trade/order"
+        response = requests.post(
+            url,
+            impersonate="chrome",
+            json=payload,
+            headers=build_headers(csrf_token),
+            cookies=cookies,
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        print(
+            f"Failed to place order for {symbol}. Status code: {response.status_code}"
+        )
+        print(f"Response text: {response.text}")
+        if "cannot be traded" in response.text.lower():
+            raise Exception(f"{symbol} cannot traded")
+        return None
+    except Exception as e:
+        await sofi_error(
+            f"Error placing order for {symbol}: {e}", discord_loop=discord_loop
+        )
+        return None
+
+
+async def place_fractional_order(
+    symbol, quantity, account_id, order_type, cookies, csrf_token, discord_loop=None
+):
+    try:
+        # Step 1: Fetch the current stock price to calculate cashAmount
+        stock_price = await fetch_stock_price(symbol)
+        if stock_price is None:
+            raise Exception(f"Failed to retrieve stock price for {symbol}")
+
+        # Calculate the cash amount based on the quantity of fractional shares
+        cash_amount = round(
+            stock_price * quantity, 2
+        )  # Round to 2 decimal places for currency
+
+        # Step 2: Prepare payload for the fractional sell order
+        payload = {
+            "operation": order_type,
+            "cashAmount": cash_amount,  # Calculated cash amount based on stock price and quantity
+            "quantity": quantity,
+            "symbol": symbol,
+            "accountId": account_id,
+            "time": "DAY",
+            "type": "MARKET",
+            "tradingSession": "CORE_HOURS",
+            "sellAll": False,
+        }
+
+        # Step 3: Send the request to sell fractional shares
+        url = "https://www.sofi.com/wealth/backend/api/v1/trade/order-fractional"
+        response = requests.post(
+            url,
+            impersonate="chrome",
+            json=payload,
+            headers=build_headers(csrf_token),
+            cookies=cookies,
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        print(
+            f"Failed to place fractional sell order for {symbol}. Status code: {response.status_code}"
+        )
+        print(f"Response text: {response.text}")
+        if "cannot be traded" in response.text.lower():
+            raise Exception(f"{symbol} cannot traded")
+        return None
+    except Exception as e:
+        await sofi_error(
+            f"Error placing fractional order for {symbol}: {e}",
+            discord_loop=discord_loop,
+        )
+        return None

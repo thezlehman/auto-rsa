@@ -7,10 +7,10 @@ import os
 import sys
 import traceback
 
-# Check Python version (minimum 3.10)
+# Check Python version (minimum 3.10, maximum 3.12)
 print("Python version:", sys.version)
-if sys.version_info < (3, 10):
-    print("ERROR: Python 3.10 or newer is required")
+if sys.version_info < (3, 10) or sys.version_info >= (3, 13):
+    print("Error: Python version must be between 3.10 and 3.12")
     sys.exit(1)
 print()
 
@@ -36,13 +36,13 @@ try:
     from publicAPI import *
     from robinhoodAPI import *
     from schwabAPI import *
+    from sofiAPI import *
     from tastyAPI import *
     from tornadoAPI import *
     from tradierAPI import *
     from vanguardAPI import *
     from webullAPI import *
     from wellsfargoAPI import *
-    from sofiAPI import *
 except Exception as e:
     print(f"Error importing libraries: {e}")
     print(traceback.format_exc())
@@ -51,7 +51,6 @@ except Exception as e:
 
 # Initialize .env file
 load_dotenv()
-
 
 # Global variables
 SUPPORTED_BROKERS = [
@@ -64,6 +63,7 @@ SUPPORTED_BROKERS = [
     "public",
     "robinhood",
     "schwab",
+    "sofi",
     "tastytrade",
     "tornado",
     "tradier",
@@ -79,6 +79,7 @@ DAY1_BROKERS = [
     "firstrade",
     "public",
     "schwab",
+    "sofi",
     "tastytrade",
     "tradier",
     "webull",
@@ -149,7 +150,7 @@ def fun_run(orderObj: stockOrder, command, botObj=None, loop=None):
                     orderObj.set_logged_in(
                         globals()[fun_name](botObj=botObj, loop=loop), broker
                     )
-                elif broker.lower() in ["chase", "fidelity", "vanguard"]:
+                elif broker.lower() in ["chase", "fidelity", "sofi", "vanguard"]:
                     fun_name = broker + "_run"
                     # PLAYWRIGHT_BROKERS have to run all transactions with one function
                     th = ThreadHandler(
@@ -172,7 +173,7 @@ def fun_run(orderObj: stockOrder, command, botObj=None, loop=None):
                     orderObj.set_logged_in(globals()[fun_name](), broker)
 
                 print()
-                if broker.lower() not in ["chase", "fidelity", "vanguard"]:
+                if broker.lower() not in ["chase", "fidelity", "sofi", "vanguard"]:
                     # Verify broker is logged in
                     orderObj.order_validate(preLogin=False)
                     logged_in_broker = orderObj.get_logged_in(broker)
